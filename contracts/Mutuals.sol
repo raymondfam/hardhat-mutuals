@@ -2,6 +2,7 @@
 pragma solidity ^0.8.7;
 
 import "./interfaces/IWETH.sol";
+import "./interfaces/IERC20.sol";
 
 contract Mutuals {
     IERC20 public immutable token0;
@@ -117,8 +118,13 @@ contract Mutuals {
         x / y = dx / dy
         dy = y / x * dx
         */
+
+        uint operand0 = reserve0 * _amount1;
+        uint operand1 = reserve1 * _amount0;
+
         if (reserve0 > 0 || reserve1 > 0) {
-            require(reserve0 * _amount1 == reserve1 * _amount0, "x / y != dx / dy");
+            require(_min(operand0, operand1) * 100 / _max(operand0, operand1) >= 95, 
+            "x / y != dx / dy not satisfied. Please input at least 10 wei");
         }
 
         /*
@@ -274,27 +280,12 @@ contract Mutuals {
     function _min(uint x, uint y) private pure returns (uint) {
         return x <= y ? x : y;
     }
-}
 
-interface IERC20 {
-    function totalSupply() external view returns (uint);
+    function _max(uint x, uint y) private pure returns (uint) {
+        return x >= y ? x : y;
+    }
 
-    function balanceOf(address account) external view returns (uint);
-
-    function transfer(address recipient, uint amount) external returns (bool);
-
-    function allowance(address owner, address spender) external view returns (uint);
-
-    function approve(address spender, uint amount) external returns (bool);
-
-    function transferFrom(
-        address sender,
-        address recipient,
-        uint amount
-    ) external returns (bool);
-
-    function mint(address to, uint256 amount) external;
-
-    event Transfer(address indexed from, address indexed to, uint amount);
-    event Approval(address indexed owner, address indexed spender, uint amount);
+    function getLP(address account) public view returns (uint256) {
+        return balanceOf[account];
+    }
 }
