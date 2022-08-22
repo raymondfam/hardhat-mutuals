@@ -3,30 +3,49 @@ pragma solidity ^0.8.7;
 
 import "./interfaces/IWETH.sol";
 import "./interfaces/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract Mutuals {
+/* @title A sample staking contract that rewards liquidity providers with Achiever tokens
+ * @author Raymond Fam
+ * @notice This contract embeds Synthetic reward algorithm in constant product AMM logics.
+ * @dev This contract will be owned by Timelock.sol when the platform is DAO-driven.
+ */
+
+contract Mutuals is Ownable {
+    /* WETH and Achiever token pair and their related state variables */
     IERC20 public immutable token0;
     IERC20 public immutable token1;
 
-    uint public reserve0;
-    uint public reserve1;
+    uint256 public reserve0;
+    uint256 public reserve1;
 
-    uint public rewardRate = 100;
-    uint public lastUpdateTime;
-    uint public rewardPerTokenStored;
+    uint256 public rewardRate;
+    uint256 public lastUpdateTime;
+    uint256 public rewardPerTokenStored;
 
-    mapping(address => uint) public userRewardPerTokenPaid;
-    mapping(address => uint) public rewards;
+    mapping(address => uint256) public userRewardPerTokenPaid;
+    mapping(address => uint256) public rewards;
 
-    uint public totalSupply;
-    mapping(address => uint) public balanceOf;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+
+    /* Events */
+    event RewardRate(uint256 indexed oldRate, uint256 indexed newRate);
 
     constructor(address _token0, address _token1) {
         token0 = IERC20(_token0);
         token1 = IERC20(_token1);
     }
 
-    function rewardPerToken() public view returns (uint) {
+    /* Synthetic Reward Logics */
+    function setRewardRate(uint256 newRate) external onlyOwner {
+        uint256 oldRate = rewardRate;
+        rewardRate = newRate;
+        // Emit an event when a new reward rate is set.
+        emit RewardRate(oldRate, rewardRate);
+    }
+
+    function rewardPerToken() public view returns (uint256) {
         if (totalSupply == 0) {
             return rewardPerTokenStored;
         }
@@ -35,10 +54,9 @@ contract Mutuals {
             (((block.timestamp - lastUpdateTime) * rewardRate * 1e18) / totalSupply);
     }
 
-    function earned(address account) public view returns (uint) {
+    function earned(address account) public view returns (uint256) {
         return
-            ((balanceOf[account] *
-                (rewardPerToken() - userRewardPerTokenPaid[account])) / 1e18) +
+            ((balanceOf[account] * (rewardPerToken() - userRewardPerTokenPaid[account])) / 1e18) +
             rewards[account];
     }
 
@@ -50,48 +68,35 @@ contract Mutuals {
         userRewardPerTokenPaid[account] = rewardPerTokenStored;
     }
 
-    function _mint(address _to, uint _amount) private {
+    /* Constant Product Automated Market Maker (CPAMM) Logics */
+    function _mint(address _to, uint256 _amount) private {
         balanceOf[_to] += _amount;
         totalSupply += _amount;
     }
 
-    function _burn(address _from, uint _amount) private {
+    function _burn(address _from, uint256 _amount) private {
         balanceOf[_from] -= _amount;
         totalSupply -= _amount;
     }
 
-    function _update(uint _reserve0, uint _reserve1) private {
+    function _update(uint256 _reserve0, uint256 _reserve1) private {
         reserve0 = _reserve0;
         reserve1 = _reserve1;
     }
 
-    function swap(address _tokenIn, uint _amountIn) external returns (uint amountOut) {
-        require(
-            _tokenIn == address(token0) || _tokenIn == address(token1),
-            "invalid token"
-        );
+    function swap(address _tokenIn, uint256 _amountIn) external returns (uint256 amountOut) {
+        require(_tokenIn == address(token0) || _tokenIn == address(token1), "invalid token");
         require(_amountIn > 0, "amount in = 0");
 
         bool isToken0 = _tokenIn == address(token0);
-        (IERC20 tokenIn, IERC20 tokenOut, uint reserveIn, uint reserveOut) = isToken0
+        (IERC20 tokenIn, IERC20 tokenOut, uint256 reserveIn, uint256 reserveOut) = isToken0
             ? (token0, token1, reserve0, reserve1)
             : (token1, token0, reserve1, reserve0);
 
         tokenIn.transferFrom(msg.sender, address(this), _amountIn);
 
-        /*
-        How much dy for dx?
-
-        xy = k
-        (x + dx)(y - dy) = k
-        y - dy = k / (x + dx)
-        y - k / (x + dx) = dy
-        y - xy / (x + dx) = dy
-        (yx + ydx - xy) / (x + dx) = dy
-        ydx / (x + dx) = dy
-        */
-        // 0.3% fee
-        uint amountInWithFee = (_amountIn * 997) / 1000;
+        // 3 % fees to Liquidity Provider
+        uint256 amountInWithFee = (_amountIn * 997) / 1000;
         amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
 
         tokenOut.transfer(msg.sender, amountOut);
@@ -99,91 +104,25 @@ contract Mutuals {
         _update(token0.balanceOf(address(this)), token1.balanceOf(address(this)));
     }
 
-    function addLiquidity(uint _amount0, uint _amount1) external returns (uint shares) {
+    function addLiquidity(uint256 _amount0, uint256 _amount1) external returns (uint256 shares) {
         token0.transferFrom(msg.sender, address(this), _amount0);
         token1.transferFrom(msg.sender, address(this), _amount1);
 
-        /*
-        How much dx, dy to add?
+        uint256 operand0 = reserve0 * _amount1;
+        uint256 operand1 = reserve1 * _amount0;
 
-        xy = k
-        (x + dx)(y + dy) = k'
-
-        No price change, before and after adding liquidity
-        x / y = (x + dx) / (y + dy)
-
-        x(y + dy) = y(x + dx)
-        x * dy = y * dx
-
-        x / y = dx / dy
-        dy = y / x * dx
-        */
-
-        uint operand0 = reserve0 * _amount1;
-        uint operand1 = reserve1 * _amount0;
-
+        // 5 % tolerance to cater for irrational numbers with non-repeating decimals
         if (reserve0 > 0 || reserve1 > 0) {
-            require(_min(operand0, operand1) * 100 / _max(operand0, operand1) >= 95, 
-            "x / y != dx / dy not satisfied. Please input at least 10 wei");
+            require(
+                (_min(operand0, operand1) * 100) / _max(operand0, operand1) >= 95,
+                "x / y != dx / dy not satisfied. Please input at least 10 wei"
+            );
         }
 
-        /*
-        How much shares to mint?
-
-        f(x, y) = value of liquidity
-        We will define f(x, y) = sqrt(xy)
-
-        L0 = f(x, y)
-        L1 = f(x + dx, y + dy)
-        T = total shares
-        s = shares to mint
-
-        Total shares should increase proportional to increase in liquidity
-        L1 / L0 = (T + s) / T
-
-        L1 * T = L0 * (T + s)
-
-        (L1 - L0) * T / L0 = s 
-        */
-
-        /*
-        Claim
-        (L1 - L0) / L0 = dx / x = dy / y
-
-        Proof
-        --- Equation 1 ---
-        (L1 - L0) / L0 = (sqrt((x + dx)(y + dy)) - sqrt(xy)) / sqrt(xy)
-        
-        dx / dy = x / y so replace dy = dx * y / x
-
-        --- Equation 2 ---
-        Equation 1 = (sqrt(xy + 2ydx + dx^2 * y / x) - sqrt(xy)) / sqrt(xy)
-
-        Multiply by sqrt(x) / sqrt(x)
-        Equation 2 = (sqrt(x^2y + 2xydx + dx^2 * y) - sqrt(x^2y)) / sqrt(x^2y)
-                   = (sqrt(y)(sqrt(x^2 + 2xdx + dx^2) - sqrt(x^2)) / (sqrt(y)sqrt(x^2))
-        
-        sqrt(y) on top and bottom cancels out
-
-        --- Equation 3 ---
-        Equation 2 = (sqrt(x^2 + 2xdx + dx^2) - sqrt(x^2)) / (sqrt(x^2)
-        = (sqrt((x + dx)^2) - sqrt(x^2)) / sqrt(x^2)  
-        = ((x + dx) - x) / x
-        = dx / x
-
-        Since dx / dy = x / y,
-        dx / x = dy / y
-
-        Finally
-        (L1 - L0) / L0 = dx / x = dy / y
-        */
         if (totalSupply == 0) {
             shares = _sqrt(_amount0 * _amount1);
         } else {
-            shares = _min(
-                (_amount0 * totalSupply) / reserve0,
-                (_amount1 * totalSupply) / reserve1
-            );
+            shares = _min((_amount0 * totalSupply) / reserve0, (_amount1 * totalSupply) / reserve1);
         }
         require(shares > 0, "shares = 0");
 
@@ -194,48 +133,9 @@ contract Mutuals {
         _update(token0.balanceOf(address(this)), token1.balanceOf(address(this)));
     }
 
-    function removeLiquidity(uint _shares)
-        external
-        returns (uint amount0, uint amount1)
-    {
-        /*
-        Claim
-        dx, dy = amount of liquidity to remove
-        dx = s / T * x
-        dy = s / T * y
-
-        Proof
-        Let's find dx, dy such that
-        v / L = s / T
-        
-        where
-        v = f(dx, dy) = sqrt(dxdy)
-        L = total liquidity = sqrt(xy)
-        s = shares
-        T = total supply
-
-        --- Equation 1 ---
-        v = s / T * L
-        sqrt(dxdy) = s / T * sqrt(xy)
-
-        Amount of liquidity to remove must not change price so 
-        dx / dy = x / y
-
-        replace dy = dx * y / x
-        sqrt(dxdy) = sqrt(dx * dx * y / x) = dx * sqrt(y / x)
-
-        Divide both sides of Equation 1 with sqrt(y / x)
-        dx = s / T * sqrt(xy) / sqrt(y / x)
-           = s / T * sqrt(x^2) = s / T * x
-
-        Likewise
-        dy = s / T * y
-        */
-
-        // bal0 >= reserve0
-        // bal1 >= reserve1
-        uint bal0 = token0.balanceOf(address(this));
-        uint bal1 = token1.balanceOf(address(this));
+    function removeLiquidity(uint256 _shares) external returns (uint256 amount0, uint256 amount1) {
+        uint256 bal0 = token0.balanceOf(address(this));
+        uint256 bal1 = token1.balanceOf(address(this));
 
         amount0 = (_shares * bal0) / totalSupply;
         amount1 = (_shares * bal1) / totalSupply;
@@ -251,23 +151,26 @@ contract Mutuals {
 
     function getReward() external {
         _updateReward(msg.sender);
-        uint reward = rewards[msg.sender];
+        uint256 reward = rewards[msg.sender];
         rewards[msg.sender] = 0;
+        // This contract is granted a minter role for Achiever reward token
         token1.mint(msg.sender, reward);
     }
 
-    function calculateToken0Amount (uint y) external view returns (uint) {
-        return reserve0 * y / reserve1;  
+    /* Token pair amount calculator for users opting to interact with the eterscan */
+    function calculateToken0Amount(uint256 y) external view returns (uint256) {
+        return (reserve0 * y) / reserve1;
     }
 
-    function calculateToken1Amount (uint x) external view returns (uint) {
-        return reserve1 * x / reserve0;  
+    function calculateToken1Amount(uint256 x) external view returns (uint256) {
+        return (reserve1 * x) / reserve0;
     }
 
-    function _sqrt(uint y) private pure returns (uint z) {
+    /* Pure functions to aid with CPAMM calculations */
+    function _sqrt(uint256 y) private pure returns (uint256 z) {
         if (y > 3) {
             z = y;
-            uint x = y / 2 + 1;
+            uint256 x = y / 2 + 1;
             while (x < z) {
                 z = x;
                 x = (y / x + x) / 2;
@@ -277,15 +180,11 @@ contract Mutuals {
         }
     }
 
-    function _min(uint x, uint y) private pure returns (uint) {
+    function _min(uint256 x, uint256 y) private pure returns (uint256) {
         return x <= y ? x : y;
     }
 
-    function _max(uint x, uint y) private pure returns (uint) {
+    function _max(uint256 x, uint256 y) private pure returns (uint256) {
         return x >= y ? x : y;
-    }
-
-    function getLP(address account) public view returns (uint256) {
-        return balanceOf[account];
     }
 }
